@@ -240,4 +240,29 @@ class Adfs
 
         return ADFS_IDP::receivePassiveAuthnRequest($request, $soapEnvelope, $idp);
     }
+
+
+    /**
+     * @param \Symfony\Component\HttpFoundation\Request $request
+     * @return \Symfony\Component\HttpFoundation\Response
+     */
+    public function certificatemixed(Request $request): Response
+    {
+        if (!$this->config->getOptionalBoolean('enable.adfs-idp', false)) {
+            throw new SspError\Error('NOACCESS');
+        }
+
+        $soapMessage = $request->getContent();
+        if ($soapMessage === false) {
+            throw new SspError\BadRequest('Missing SOAP-content.');
+        }
+
+        $domDocument = DOMDocumentFactory::fromString($soapMessage);
+        $soapEnvelope = Envelope::fromXML($domDocument->documentElement);
+
+        $idpEntityId = $this->metadata->getMetaDataCurrentEntityID('adfs-idp-hosted');
+        $idp = PassiveIdP::getById($this->config, 'adfs:' . $idpEntityId);
+
+        return ADFS_IDP::receiveCertificateAuthnRequest($request, $soapEnvelope, $idp);
+    }
 }

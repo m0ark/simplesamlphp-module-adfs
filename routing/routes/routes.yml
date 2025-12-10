@@ -55,3 +55,10 @@ adfs-wstrust-usernamemixed:
     _controller: 'SimpleSAML\Module\adfs\Controller\Adfs::usernamemixed'
   }
   methods: [POST]
+
+adfs-wstrust-certificatemixed:
+  path: /ws-trust/2005/services/certificatemixed
+  defaults: {
+    _controller: 'SimpleSAML\Module\adfs\Controller\Adfs::certificatemixed'
+  }
+  methods: [POST]
