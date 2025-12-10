@@ -43,6 +43,7 @@ use SimpleSAML\WSSecurity\XML\wsa_200508\To;
 use SimpleSAML\WSSecurity\XML\wsp\AppliesTo;
 use SimpleSAML\WSSecurity\XML\wsse\KeyIdentifier;
 use SimpleSAML\WSSecurity\XML\wsse\Password;
+use SimpleSAML\WSSecurity\XML\wsse\BinarySecurityToken;
 use SimpleSAML\WSSecurity\XML\wsse\Security;
 use SimpleSAML\WSSecurity\XML\wsse\SecurityTokenReference;
 use SimpleSAML\WSSecurity\XML\wsse\UsernameToken;
@@ -65,6 +66,7 @@ use SimpleSAML\XMLSecurity\Alg\Signature\SignatureAlgorithmFactory;
 use SimpleSAML\XMLSecurity\Key\PrivateKey;
 use SimpleSAML\XMLSecurity\Key\X509Certificate as PublicKey;
 use SimpleSAML\XMLSecurity\XML\ds\KeyInfo;
+use SimpleSAML\XMLSecurity\XML\ds\Signature;
 use SimpleSAML\XMLSecurity\XML\ds\X509Certificate;
 use SimpleSAML\XMLSecurity\XML\ds\X509Data;
 use Symfony\Component\HttpFoundation\Request;
@@ -164,6 +166,181 @@ class ADFS
         return new StreamedResponse(
             function () use ($idp, &$state) {
                 $idp->handleAuthenticationRequest($state);
+            },
+        );
+    }
+
+
+    /**
+     * @param \Symfony\Component\HttpFoundation\Request $request
+     * @param \SimpleSAML\SOAP\XML\env_200305\Envelope $soapEnvelope
+     * @param \SimpleSAML\Module\adfs\IdP\PassiveIdP $idp
+     * @return \Symfony\Component\HttpFoundation\StreamedResponse
+     * @throws \SimpleSAML\Error\MetadataNotFound
+     */
+    public static function receiveCertificateAuthnRequest(
+        Request $request,
+        Envelope $soapEnvelope,
+        PassiveIdP $idp,
+    ): StreamedResponse {
+        // Parse the SOAP-header
+        $header = $soapEnvelope->getHeader();
+
+        $to = To::getChildrenOfClass($header->toXML());
+        Assert::count($to, 1, 'Missing To in SOAP Header.');
+        $to = array_pop($to);
+
+        $action = Action::getChildrenOfClass($header->toXML());
+        Assert::count($action, 1, 'Missing Action in SOAP Header.');
+        $action = array_pop($action);
+
+        $messageid = MessageID::getChildrenOfClass($header->toXML());
+        Assert::count($messageid, 1, 'Missing MessageID in SOAP Header.');
+        $messageid = array_pop($messageid);
+
+        $security = Security::getChildrenOfClass($header->toXML());
+        Assert::count($security, 1, 'Missing Security in SOAP Header.');
+        $security = array_pop($security);
+
+        // Parse the SOAP-body
+        $body = $soapEnvelope->getBody();
+
+        $requestSecurityToken = RequestSecurityToken::getChildrenOfClass($body->toXML());
+        Assert::count($requestSecurityToken, 1, 'Missing RequestSecurityToken in SOAP Body.');
+        $requestSecurityToken = array_pop($requestSecurityToken);
+
+        $appliesTo = AppliesTo::getChildrenOfClass($requestSecurityToken->toXML());
+        Assert::count($appliesTo, 1, 'Missing AppliesTo in RequestSecurityToken.');
+        $appliesTo = array_pop($appliesTo);
+
+        $endpointReference = EndpointReference::getChildrenOfClass($appliesTo->toXML());
+        Assert::count($endpointReference, 1, 'Missing EndpointReference in AppliesTo.');
+        $endpointReference = array_pop($endpointReference);
+
+        // Make sure the message was addressed to us.
+        if ($to === null || $request->server->get('SCRIPT_URI') !== $to->getContent()) {
+            throw new Error\BadRequest('This server is not the audience for the message received.');
+        }
+
+        // Ensure we know the issuer
+        $issuer = $endpointReference->getAddress()->getContent();
+
+        $metadata = MetaDataStorageHandler::getMetadataHandler(Configuration::getInstance());
+        $spMetadata = $metadata->getMetaDataConfig($issuer, 'adfs-sp-remote');
+
+        // Extract Client Certificate
+        $bst = BinarySecurityToken::getChildrenOfClass($security->toXML());
+        Assert::count($bst, 1, 'Missing BinarySecurityToken in Security.');
+        $bst = array_pop($bst);
+        $clientCertData = $bst->getContent();
+        $clientCert = new PublicKey(PublicKey::normalizeCertificate($clientCertData));
+
+        // Verify XML Signature
+        $signatures = Signature::getChildrenOfClass($security->toXML());
+        Assert::count($signatures, 1, 'Missing Signature in Security header.');
+        /** @var \SimpleSAML\XMLSecurity\XML\ds\Signature $signature */
+        $signature = array_pop($signatures);
+
+        // Verify the signature against the client certificate
+        if (!$signature->verify($clientCert)) {
+             throw new Error\BadRequest('SOAP Signature verification failed.');
+        }
+
+        // Verify Certificate Chain against Trusted CAs
+        $idpConfig = $idp->getConfig();
+        $caFiles = $idpConfig->getOptionalArray('certificate_authorities', []);
+
+        if (empty($caFiles)) {
+             throw new Error\Exception('No certificate authorities configured for ADFS certificatemixed endpoint.');
+        }
+
+        // Create a temporary file to hold the client cert for openssl check
+        $clientCertPem = $clientCert->getPEM();
+
+        $verified = false;
+        foreach ($caFiles as $caFile) {
+             // Resolve path
+             $configUtils = new Utils\Config();
+             $caFilePath = $configUtils->getCertPath($caFile);
+
+             // Verify
+             $certRes = openssl_x509_read($clientCertPem);
+             if ($certRes) {
+                  $result = openssl_x509_checkpurpose($certRes, X509_PURPOSE_SSL_CLIENT, [$caFilePath]);
+                  if ($result === true) {
+                      $verified = true;
+                      break;
+                  }
+             }
+        }
+
+        if (!$verified) {
+             throw new Error\BadRequest('Client certificate could not be verified against trusted CAs.');
+        }
+
+        // Authenticate User
+        $certDetails = openssl_x509_parse($clientCertPem);
+        $subject = $certDetails['subject'];
+        $subjectDN = ''; // Reconstruct DN or use what's available
+        // openssl_x509_parse returns subject as array.
+        // We can just use the name from the parser or try to get the DN string.
+
+        // Simple mapping: Use the CN or emailAddress from Subject
+        $username = null;
+        if (isset($subject['emailAddress'])) {
+             $username = $subject['emailAddress'];
+        } elseif (isset($subject['CN'])) {
+             $username = $subject['CN'];
+        }
+
+        // Also check SANs
+        if (isset($certDetails['extensions']['subjectAltName'])) {
+             // Format usually: "email:foo@bar.com, DNS:example.com"
+             $sans = explode(',', $certDetails['extensions']['subjectAltName']);
+             foreach ($sans as $san) {
+                  $san = trim($san);
+                  if (str_starts_with($san, 'email:')) {
+                       $username = substr($san, 6);
+                       break;
+                  }
+                  if (str_starts_with($san, 'othername:') && strpos($san, '1.3.6.1.4.1.311.20.2.3') !== false) {
+                       // UPN OID
+                       // Parsing UPN from othername is complex (ASN.1). Skipping for simplicity unless needed.
+                  }
+             }
+        }
+
+        if (!$username) {
+             throw new Error\BadRequest('Could not extract username (CN, Email, or SAN Email) from client certificate.');
+        }
+
+        Logger::info('ADFS certificatemixed: Authenticated user ' . $username);
+
+        $attributes = [
+             'http://schemas.xmlsoap.org/claims/UPN' => [$username],
+             'http://schemas.microsoft.com/LiveID/Federation/2008/05/ImmutableID' => [$username], // Fallback
+             // Add other attributes if available or mapped
+        ];
+
+        $state = [
+            'Responder' => [ADFS::class, 'sendPassiveResponse'],
+            'SPMetadata' => $spMetadata->toArray(),
+            'MessageID' => $messageid->getContent(),
+            'saml:Binding' => SAML2_C::BINDING_PAOS,
+            'Attributes' => $attributes,
+            'IdPMetadata' => $idpConfig->toArray(),
+            'saml:NameID' => [SAML2_C::NAMEID_UNSPECIFIED => new \SimpleSAML\SAML2\XML\saml\NameID($username)],
+            'adfs:wctx' => null, // Not usually present in this flow or extracted differently?
+            // In receivePassiveAuthnRequest (usernamemixed), wctx is not extracted from query,
+            // but the SOAP request might contain context?
+            // Standard usernamemixed flow doesn't use wctx in the SOAP body usually.
+            'adfs:wreply' => $spMetadata->getValue('prp'),
+        ];
+
+        // Call sendPassiveResponse directly
+        return new StreamedResponse(
+            function () use ($state) {
+                ADFS::sendPassiveResponse($state);
             },
         );
     }

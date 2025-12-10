@@ -196,15 +196,38 @@ class MetadataBuilder
     {
         $defaultEndpoint = Module::getModuleURL('adfs') . '/idp/prp.php';
 
+        $stsEndpoints = [
+            new SecurityTokenServiceEndpoint([
+                new EndpointReference(new Address($defaultEndpoint)),
+            ]),
+        ];
+
+        if ($this->config->getOptionalBoolean('adfs.mex_in_metadata', true)) {
+            $mexEndpoint = Module::getModuleURL('adfs') . '/ws-trust/mex';
+            $stsEndpoints[] = new SecurityTokenServiceEndpoint([
+                new EndpointReference(new Address($mexEndpoint)),
+            ]);
+        }
+
+        if ($this->config->getOptionalBoolean('adfs.certificatemixed_in_metadata', false)) {
+            $certEndpoint = Module::getModuleURL('adfs') . '/ws-trust/2005/services/certificatemixed';
+            $stsEndpoints[] = new SecurityTokenServiceEndpoint([
+                new EndpointReference(new Address($certEndpoint)),
+            ]);
+        }
+
+        if ($this->config->getOptionalBoolean('adfs.usernamemixed_in_metadata', false)) {
+            $unEndpoint = Module::getModuleURL('adfs') . '/ws-trust/2005/services/usernamemixed';
+            $stsEndpoints[] = new SecurityTokenServiceEndpoint([
+                new EndpointReference(new Address($unEndpoint)),
+            ]);
+        }
+
         return new SecurityTokenServiceType(
             protocolSupportEnumeration: [C::NS_TRUST_200512, C::NS_TRUST_200502, C::NS_FED],
             keyDescriptors: $this->getKeyDescriptor(),
             tokenTypesOffered: new TokenTypesOffered([new TokenType('urn:oasis:names:tc:SAML:1.0:assertion')]),
-            securityTokenServiceEndpoint: [
-                new SecurityTokenServiceEndpoint([
-                    new EndpointReference(new Address($defaultEndpoint)),
-                ]),
-            ],
+            securityTokenServiceEndpoint: $stsEndpoints,
             passiveRequestorEndpoint: [
                 new PassiveRequestorEndpoint([
                     new EndpointReference(new Address($defaultEndpoint)),
